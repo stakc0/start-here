@@ -38,6 +38,12 @@ function youtubeOnly(value) {
   catch { return false; }
 }
 function safeName(name) { return name.replace(/[^a-zA-Z0-9._ -]/g, '_').replace(/\s+/g, ' ').slice(0, 180); }
+function bitrateFor(quality) {
+  if (quality === '320') return '320k';
+  if (quality === '192') return '192k';
+  if (quality === '128') return '128k';
+  return '192k';
+}
 function run(bin, args, timeoutMs = 20 * 60 * 1000) {
   const env = { ...process.env, PATH: `${process.env.HOME || ''}/.local/bin:${process.env.PATH || ''}` };
   return new Promise((resolve, reject) => {
@@ -86,19 +92,32 @@ app.post('/api/download', async (req, res) => {
     const info = JSON.parse(meta.stdout.split('\n').filter(Boolean).pop());
     if ((info.duration || 0) > 3 * 60 * 60) return jsonError(res, 400, 'Video is longer than the 3-hour limit.');
     const title = safeName(info.title || 'archive');
-    const outTpl = path.join(downloadsDir, `${title}-${info.id || id}-%(format_id)s.%(ext)s`);
+    let outputPath;
     let args;
     if (format === 'mp3') {
-      const q = quality === 'audio-best' ? '0' : `${quality}K`;
-      args = ['--no-playlist', '-x', '--audio-format', 'mp3', '--audio-quality', q, '-o', outTpl, url];
+      outputPath = path.join(downloadsDir, `${title}-${info.id || id}.mp3`);
+      args = [
+        '--no-playlist',
+        '-f', 'ba/b',
+        '--extract-audio',
+        '--audio-format', 'mp3',
+        '--audio-quality', '0',
+        '--postprocessor-args', `ffmpeg:-codec:a libmp3lame -b:a ${bitrateFor(quality)} -ar 44100 -ac 2 -id3v2_version 3`,
+        '-o', outputPath,
+        url
+      ];
     } else {
-      const map = { best: 'bv*+ba/b', '1080': 'bv*[height<=1080]+ba/b[height<=1080]', '720': 'bv*[height<=720]+ba/b[height<=720]', '480': 'bv*[height<=480]+ba/b[height<=480]', '360': 'bv*[height<=360]+ba/b[height<=360]' };
-      args = ['--no-playlist', '-f', map[quality] || map.best, '--merge-output-format', 'mp4', '-o', outTpl, url];
+      outputPath = path.join(downloadsDir, `${title}-${info.id || id}.mp4`);
+      const map = { best: 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b', '1080': 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b[height<=1080]', '720': 'bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/bv*[height<=720]+ba/b[height<=720]', '480': 'bv*[height<=480][ext=mp4]+ba[ext=m4a]/b[height<=480][ext=mp4]/bv*[height<=480]+ba/b[height<=480]', '360': 'bv*[height<=360][ext=mp4]+ba[ext=m4a]/b[height<=360][ext=mp4]/bv*[height<=360]+ba/b[height<=360]' };
+      args = ['--no-playlist', '-f', map[quality] || map.best, '--merge-output-format', 'mp4', '--postprocessor-args', 'ffmpeg:-c:v libx264 -preset veryfast -c:a aac -b:a 192k -movflags +faststart', '-o', outputPath, url];
     }
     await run(YTDLP_BIN, args);
-    const files = (await readdir(downloadsDir)).filter(f => f.includes(info.id || id)).sort();
-    if (!files.length) throw new Error('Download completed but no output file was found.');
-    const filename = files[files.length - 1];
+    let filename = path.basename(outputPath);
+    try { await stat(outputPath); } catch {
+      const files = (await readdir(downloadsDir)).filter(f => f.includes(info.id || id)).sort();
+      if (!files.length) throw new Error('Download completed but no output file was found.');
+      filename = files[files.length - 1];
+    }
     setTimeout(() => unlink(path.join(downloadsDir, filename)).catch(() => {}), TTL_MS).unref();
     res.json({ success: true, title: info.title || 'Archive', filename, downloadUrl: `/api/file/${encodeURIComponent(filename)}?pin=${encodeURIComponent(ARCHIVE_PIN)}` });
   } catch (e) {
