@@ -19,6 +19,7 @@ const YOUTUBE_COOKIES = process.env.YOUTUBE_COOKIES || '';
 const TTL_MS = 15 * 60 * 1000;
 const PLAYER_CLIENTS = process.env.YTDLP_PLAYER_CLIENTS || 'default,tv';
 const REMOTE_COMPONENTS = process.env.YTDLP_REMOTE_COMPONENTS || 'ejs:github';
+const JS_RUNTIMES = (process.env.YTDLP_JS_RUNTIMES || `node:${NODE_BIN}`).trim();
 const USER_AGENT = process.env.YTDLP_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 let busy = false;
 
@@ -47,13 +48,13 @@ function youtubeOnly(value) {
   catch { return false; }
 }
 function safeName(name) { return name.replace(/[^a-zA-Z0-9._ -]/g, '_').replace(/\s+/g, ' ').slice(0, 180); }
-async function ytDlpArgs(extra) {
+async function ytDlpArgs(extra, overrides = {}) {
   const args = [
     '--no-warnings',
-    '--js-runtimes', `node:${NODE_BIN}`,
-    '--remote-components', REMOTE_COMPONENTS,
+    '--js-runtimes', overrides.jsRuntimes || JS_RUNTIMES,
+    '--remote-components', overrides.remoteComponents || REMOTE_COMPONENTS,
     '--user-agent', USER_AGENT,
-    '--extractor-args', `youtube:player_client=${PLAYER_CLIENTS}`,
+    '--extractor-args', `youtube:player_client=${overrides.playerClients || PLAYER_CLIENTS}`,
     ...extra
   ];
   try {
@@ -75,6 +76,28 @@ function run(bin, args, timeoutMs = 20 * 60 * 1000) {
     child.on('close', code => { clearTimeout(timer); code === 0 ? resolve({ stdout, stderr }) : reject(new Error(stderr || `${bin} exited ${code}`)); });
   });
 }
+function shouldRetryYoutube(e) {
+  const msg = String(e?.message || e);
+  return /n challenge solving failed|Only images are available|Requested format is not available|SABR|missing a URL/i.test(msg);
+}
+async function ytDlpWithFallback(extra, timeoutMs) {
+  const attempts = [
+    {},
+    { playerClients: 'tv' },
+    { playerClients: 'default' },
+    { remoteComponents: 'ejs:npm' }
+  ];
+  let lastErr;
+  for (const overrides of attempts) {
+    try {
+      return await run(YTDLP_BIN, await ytDlpArgs(extra, overrides), timeoutMs);
+    } catch (e) {
+      lastErr = e;
+      if (!shouldRetryYoutube(e)) break;
+    }
+  }
+  throw lastErr;
+}
 async function cleanup() {
   try {
     const now = Date.now();
@@ -90,7 +113,7 @@ setInterval(cleanup, 60_000).unref();
 app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'velvet-archive-api' }));
 app.get('/api/diagnostics', async (req, res) => {
   if (!checkPin(req)) return jsonError(res, 401, 'Invalid PIN.');
-  const out = { ok: true, service: 'velvet-archive-api', ytDlp: null, ffmpeg: null, node: null, playerClients: PLAYER_CLIENTS, remoteComponents: REMOTE_COMPONENTS };
+  const out = { ok: true, service: 'velvet-archive-api', ytDlp: null, ffmpeg: null, node: null, jsRuntimes: JS_RUNTIMES, playerClients: PLAYER_CLIENTS, remoteComponents: REMOTE_COMPONENTS };
   try { out.ytDlp = (await run(YTDLP_BIN, ['--version'], 30_000)).stdout.trim(); } catch (e) { out.ytDlp = String(e.message || e); out.ok = false; }
   try { out.node = (await run(NODE_BIN, ['--version'], 30_000)).stdout.trim(); } catch (e) { out.node = String(e.message || e); out.ok = false; }
   try { out.cookies = (await ytDlpArgs([])).includes('--cookies'); } catch { out.cookies = false; }
@@ -109,7 +132,7 @@ app.post('/api/download', async (req, res) => {
   try {
     await run(YTDLP_BIN, ['--version'], 30_000).catch(e => { throw new Error('yt-dlp is not installed or not available on PATH. ' + e.message); });
     await run('ffmpeg', ['-version'], 30_000).catch(e => { throw new Error('ffmpeg is not installed or not available on PATH. ' + e.message); });
-    const meta = await run(YTDLP_BIN, await ytDlpArgs(['--dump-json', '--no-playlist', url]), 90_000);
+    const meta = await ytDlpWithFallback(['--dump-json', '--no-playlist', url], 90_000);
     const info = JSON.parse(meta.stdout.split('\n').filter(Boolean).pop());
     if ((info.duration || 0) > 3 * 60 * 60) return jsonError(res, 400, 'Video is longer than the 3-hour limit.');
     const title = safeName(info.title || 'archive');
@@ -122,7 +145,7 @@ app.post('/api/download', async (req, res) => {
       const map = { best: 'bv*+ba/b', '1080': 'bv*[height<=1080]+ba/b[height<=1080]', '720': 'bv*[height<=720]+ba/b[height<=720]', '480': 'bv*[height<=480]+ba/b[height<=480]', '360': 'bv*[height<=360]+ba/b[height<=360]' };
       args = await ytDlpArgs(['--no-playlist', '-f', map[quality] || map.best, '--merge-output-format', 'mp4', '-o', outTpl, url]);
     }
-    await run(YTDLP_BIN, args);
+    await ytDlpWithFallback(args.slice(args.indexOf('--no-playlist')), undefined);
     const files = (await readdir(downloadsDir)).filter(f => f.includes(info.id || id)).sort();
     if (!files.length) throw new Error('Download completed but no output file was found.');
     const filename = files[files.length - 1];
