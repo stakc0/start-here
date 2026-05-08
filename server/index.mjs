@@ -23,9 +23,10 @@ const app = express();
 app.use(cors({
   origin(origin, cb) {
     if (!origin) return cb(null, true);
+    if (allowed.includes('*')) return cb(null, true);
     if (allowed.length === 0 && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return cb(null, true);
     if (allowed.includes(origin)) return cb(null, true);
-    cb(new Error('Origin not allowed by CORS'));
+    cb(null, false);
   }
 }));
 app.use(express.json({ limit: '1mb' }));
