@@ -108,6 +108,9 @@ app.get('/api/file/:filename', async (req, res) => {
 });
 
 app.use(express.static(distDir));
-app.get('*', (_req, res) => res.sendFile(path.join(distDir, 'index.html')));
+app.use((req, res, next) => {
+  if (req.method !== 'GET' || req.path.startsWith('/api/')) return next();
+  res.sendFile(path.join(distDir, 'index.html'));
+});
 
 app.listen(PORT, '0.0.0.0', () => console.log(`Velvet Archive API listening on ${PORT}`));
