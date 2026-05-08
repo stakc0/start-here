@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import { spawn } from 'node:child_process';
-import { mkdir, readdir, stat, unlink } from 'node:fs/promises';
+import { mkdir, readdir, stat, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
@@ -13,10 +13,15 @@ const distDir = path.join(root, 'dist');
 const PORT = process.env.PORT || 8787;
 const ARCHIVE_PIN = process.env.ARCHIVE_PIN || '2359';
 const YTDLP_BIN = process.env.YTDLP_BIN || 'yt-dlp';
+const COOKIES_PATH = process.env.COOKIES_PATH || path.join(root, 'cookies.txt');
+const YOUTUBE_COOKIES = process.env.YOUTUBE_COOKIES || '';
 const TTL_MS = 15 * 60 * 1000;
 let busy = false;
 
 await mkdir(downloadsDir, { recursive: true });
+if (YOUTUBE_COOKIES.trim()) {
+  await writeFile(COOKIES_PATH, YOUTUBE_COOKIES.trim() + '\n', { mode: 0o600 });
+}
 
 const allowed = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 const app = express();
@@ -43,6 +48,14 @@ function bitrateFor(quality) {
   if (quality === '192') return '192k';
   if (quality === '128') return '128k';
   return '192k';
+}
+async function ytDlpBaseArgs() {
+  const args = ['--js-runtimes', 'node'];
+  try {
+    await stat(COOKIES_PATH);
+    args.push('--cookies', COOKIES_PATH);
+  } catch {}
+  return args;
 }
 function run(bin, args, timeoutMs = 20 * 60 * 1000) {
   const env = { ...process.env, PATH: `${process.env.HOME || ''}/.local/bin:${process.env.PATH || ''}` };
@@ -73,6 +86,8 @@ app.get('/api/diagnostics', async (req, res) => {
   if (!checkPin(req)) return jsonError(res, 401, 'Invalid PIN.');
   const out = { ok: true, service: 'velvet-archive-api', ytDlp: null, ffmpeg: null };
   try { out.ytDlp = (await run(YTDLP_BIN, ['--version'], 30_000)).stdout.trim(); } catch (e) { out.ytDlp = String(e.message || e); out.ok = false; }
+  try { out.node = (await run('node', ['--version'], 30_000)).stdout.trim(); } catch (e) { out.node = String(e.message || e); out.ok = false; }
+  try { out.cookies = (await ytDlpBaseArgs()).includes('--cookies'); } catch { out.cookies = false; }
   try { out.ffmpeg = (await run('ffmpeg', ['-version'], 30_000)).stdout.split('\n')[0]; } catch (e) { out.ffmpeg = String(e.message || e); out.ok = false; }
   res.status(out.ok ? 200 : 500).json(out);
 });
@@ -87,8 +102,10 @@ app.post('/api/download', async (req, res) => {
   const id = crypto.randomBytes(5).toString('hex');
   try {
     await run(YTDLP_BIN, ['--version'], 30_000).catch(e => { throw new Error('yt-dlp is not installed or not available on PATH. ' + e.message); });
+    await run('node', ['--version'], 30_000).catch(e => { throw new Error('Node.js runtime is not available for yt-dlp JavaScript extraction. ' + e.message); });
     await run('ffmpeg', ['-version'], 30_000).catch(e => { throw new Error('ffmpeg is not installed or not available on PATH. ' + e.message); });
-    const meta = await run(YTDLP_BIN, ['--dump-json', '--no-playlist', url], 90_000);
+    const baseArgs = await ytDlpBaseArgs();
+    const meta = await run(YTDLP_BIN, [...baseArgs, '--dump-json', '--no-playlist', url], 90_000);
     const info = JSON.parse(meta.stdout.split('\n').filter(Boolean).pop());
     if ((info.duration || 0) > 3 * 60 * 60) return jsonError(res, 400, 'Video is longer than the 3-hour limit.');
     const title = safeName(info.title || 'archive');
@@ -97,6 +114,7 @@ app.post('/api/download', async (req, res) => {
     if (format === 'mp3') {
       outputPath = path.join(downloadsDir, `${title}-${info.id || id}.mp3`);
       args = [
+        ...baseArgs,
         '--no-playlist',
         '-f', 'ba/b',
         '--extract-audio',
@@ -109,7 +127,7 @@ app.post('/api/download', async (req, res) => {
     } else {
       outputPath = path.join(downloadsDir, `${title}-${info.id || id}.mp4`);
       const map = { best: 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b', '1080': 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b[height<=1080]', '720': 'bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/bv*[height<=720]+ba/b[height<=720]', '480': 'bv*[height<=480][ext=mp4]+ba[ext=m4a]/b[height<=480][ext=mp4]/bv*[height<=480]+ba/b[height<=480]', '360': 'bv*[height<=360][ext=mp4]+ba[ext=m4a]/b[height<=360][ext=mp4]/bv*[height<=360]+ba/b[height<=360]' };
-      args = ['--no-playlist', '-f', map[quality] || map.best, '--merge-output-format', 'mp4', '--postprocessor-args', 'ffmpeg:-c:v libx264 -preset veryfast -c:a aac -b:a 192k -movflags +faststart', '-o', outputPath, url];
+      args = [...baseArgs, '--no-playlist', '-f', map[quality] || map.best, '--merge-output-format', 'mp4', '--postprocessor-args', 'ffmpeg:-c:v libx264 -preset veryfast -c:a aac -b:a 192k -movflags +faststart', '-o', outputPath, url];
     }
     await run(YTDLP_BIN, args);
     let filename = path.basename(outputPath);
