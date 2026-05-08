@@ -13,9 +13,13 @@ const distDir = path.join(root, 'dist');
 const PORT = process.env.PORT || 8787;
 const ARCHIVE_PIN = process.env.ARCHIVE_PIN || '2359';
 const YTDLP_BIN = process.env.YTDLP_BIN || 'yt-dlp';
+const NODE_BIN = process.env.NODE_BIN || 'node';
 const COOKIES_PATH = process.env.COOKIES_PATH || path.join(root, 'cookies.txt');
 const YOUTUBE_COOKIES = process.env.YOUTUBE_COOKIES || '';
 const TTL_MS = 15 * 60 * 1000;
+const PLAYER_CLIENTS = process.env.YTDLP_PLAYER_CLIENTS || 'default,tv';
+const REMOTE_COMPONENTS = process.env.YTDLP_REMOTE_COMPONENTS || 'ejs:github';
+const USER_AGENT = process.env.YTDLP_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 let busy = false;
 
 await mkdir(downloadsDir, { recursive: true });
@@ -44,7 +48,14 @@ function youtubeOnly(value) {
 }
 function safeName(name) { return name.replace(/[^a-zA-Z0-9._ -]/g, '_').replace(/\s+/g, ' ').slice(0, 180); }
 async function ytDlpArgs(extra) {
-  const args = [...extra];
+  const args = [
+    '--no-warnings',
+    '--js-runtimes', `node:${NODE_BIN}`,
+    '--remote-components', REMOTE_COMPONENTS,
+    '--user-agent', USER_AGENT,
+    '--extractor-args', `youtube:player_client=${PLAYER_CLIENTS}`,
+    ...extra
+  ];
   try {
     await stat(COOKIES_PATH);
     args.unshift(COOKIES_PATH);
@@ -79,8 +90,9 @@ setInterval(cleanup, 60_000).unref();
 app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'velvet-archive-api' }));
 app.get('/api/diagnostics', async (req, res) => {
   if (!checkPin(req)) return jsonError(res, 401, 'Invalid PIN.');
-  const out = { ok: true, service: 'velvet-archive-api', ytDlp: null, ffmpeg: null };
+  const out = { ok: true, service: 'velvet-archive-api', ytDlp: null, ffmpeg: null, node: null, playerClients: PLAYER_CLIENTS, remoteComponents: REMOTE_COMPONENTS };
   try { out.ytDlp = (await run(YTDLP_BIN, ['--version'], 30_000)).stdout.trim(); } catch (e) { out.ytDlp = String(e.message || e); out.ok = false; }
+  try { out.node = (await run(NODE_BIN, ['--version'], 30_000)).stdout.trim(); } catch (e) { out.node = String(e.message || e); out.ok = false; }
   try { out.cookies = (await ytDlpArgs([])).includes('--cookies'); } catch { out.cookies = false; }
   try { out.ffmpeg = (await run('ffmpeg', ['-version'], 30_000)).stdout.split('\n')[0]; } catch (e) { out.ffmpeg = String(e.message || e); out.ok = false; }
   res.status(out.ok ? 200 : 500).json(out);
