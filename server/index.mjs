@@ -63,6 +63,13 @@ async function cleanup() {
 setInterval(cleanup, 60_000).unref();
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'velvet-archive-api' }));
+app.get('/api/diagnostics', async (req, res) => {
+  if (!checkPin(req)) return jsonError(res, 401, 'Invalid PIN.');
+  const out = { ok: true, service: 'velvet-archive-api', ytDlp: null, ffmpeg: null };
+  try { out.ytDlp = (await run(YTDLP_BIN, ['--version'], 30_000)).stdout.trim(); } catch (e) { out.ytDlp = String(e.message || e); out.ok = false; }
+  try { out.ffmpeg = (await run('ffmpeg', ['-version'], 30_000)).stdout.split('\n')[0]; } catch (e) { out.ffmpeg = String(e.message || e); out.ok = false; }
+  res.status(out.ok ? 200 : 500).json(out);
+});
 
 app.post('/api/download', async (req, res) => {
   if (!checkPin(req)) return jsonError(res, 401, 'Invalid PIN.');
