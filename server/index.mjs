@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import { spawn } from 'node:child_process';
-import { mkdir, readdir, stat, unlink } from 'node:fs/promises';
+import { mkdir, readdir, stat, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
@@ -13,10 +13,15 @@ const distDir = path.join(root, 'dist');
 const PORT = process.env.PORT || 8787;
 const ARCHIVE_PIN = process.env.ARCHIVE_PIN || '2359';
 const YTDLP_BIN = process.env.YTDLP_BIN || 'yt-dlp';
+const COOKIES_PATH = process.env.COOKIES_PATH || path.join(root, 'cookies.txt');
+const YOUTUBE_COOKIES = process.env.YOUTUBE_COOKIES || '';
 const TTL_MS = 15 * 60 * 1000;
 let busy = false;
 
 await mkdir(downloadsDir, { recursive: true });
+if (YOUTUBE_COOKIES.trim()) {
+  await writeFile(COOKIES_PATH, YOUTUBE_COOKIES.trim() + '\n', { mode: 0o600 });
+}
 
 const allowed = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 const app = express();
@@ -38,6 +43,15 @@ function youtubeOnly(value) {
   catch { return false; }
 }
 function safeName(name) { return name.replace(/[^a-zA-Z0-9._ -]/g, '_').replace(/\s+/g, ' ').slice(0, 180); }
+async function ytDlpArgs(extra) {
+  const args = [...extra];
+  try {
+    await stat(COOKIES_PATH);
+    args.unshift(COOKIES_PATH);
+    args.unshift('--cookies');
+  } catch {}
+  return args;
+}
 function run(bin, args, timeoutMs = 20 * 60 * 1000) {
   const env = { ...process.env, PATH: `${process.env.HOME || ''}/.local/bin:${process.env.PATH || ''}` };
   return new Promise((resolve, reject) => {
@@ -67,6 +81,7 @@ app.get('/api/diagnostics', async (req, res) => {
   if (!checkPin(req)) return jsonError(res, 401, 'Invalid PIN.');
   const out = { ok: true, service: 'velvet-archive-api', ytDlp: null, ffmpeg: null };
   try { out.ytDlp = (await run(YTDLP_BIN, ['--version'], 30_000)).stdout.trim(); } catch (e) { out.ytDlp = String(e.message || e); out.ok = false; }
+  try { out.cookies = (await ytDlpArgs([])).includes('--cookies'); } catch { out.cookies = false; }
   try { out.ffmpeg = (await run('ffmpeg', ['-version'], 30_000)).stdout.split('\n')[0]; } catch (e) { out.ffmpeg = String(e.message || e); out.ok = false; }
   res.status(out.ok ? 200 : 500).json(out);
 });
@@ -82,7 +97,7 @@ app.post('/api/download', async (req, res) => {
   try {
     await run(YTDLP_BIN, ['--version'], 30_000).catch(e => { throw new Error('yt-dlp is not installed or not available on PATH. ' + e.message); });
     await run('ffmpeg', ['-version'], 30_000).catch(e => { throw new Error('ffmpeg is not installed or not available on PATH. ' + e.message); });
-    const meta = await run(YTDLP_BIN, ['--dump-json', '--no-playlist', url], 90_000);
+    const meta = await run(YTDLP_BIN, await ytDlpArgs(['--dump-json', '--no-playlist', url]), 90_000);
     const info = JSON.parse(meta.stdout.split('\n').filter(Boolean).pop());
     if ((info.duration || 0) > 3 * 60 * 60) return jsonError(res, 400, 'Video is longer than the 3-hour limit.');
     const title = safeName(info.title || 'archive');
@@ -90,10 +105,10 @@ app.post('/api/download', async (req, res) => {
     let args;
     if (format === 'mp3') {
       const q = quality === 'audio-best' ? '0' : `${quality}K`;
-      args = ['--no-playlist', '-x', '--audio-format', 'mp3', '--audio-quality', q, '-o', outTpl, url];
+      args = await ytDlpArgs(['--no-playlist', '-x', '--audio-format', 'mp3', '--audio-quality', q, '-o', outTpl, url]);
     } else {
       const map = { best: 'bv*+ba/b', '1080': 'bv*[height<=1080]+ba/b[height<=1080]', '720': 'bv*[height<=720]+ba/b[height<=720]', '480': 'bv*[height<=480]+ba/b[height<=480]', '360': 'bv*[height<=360]+ba/b[height<=360]' };
-      args = ['--no-playlist', '-f', map[quality] || map.best, '--merge-output-format', 'mp4', '-o', outTpl, url];
+      args = await ytDlpArgs(['--no-playlist', '-f', map[quality] || map.best, '--merge-output-format', 'mp4', '-o', outTpl, url]);
     }
     await run(YTDLP_BIN, args);
     const files = (await readdir(downloadsDir)).filter(f => f.includes(info.id || id)).sort();
